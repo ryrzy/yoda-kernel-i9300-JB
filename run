@@ -1,0 +1,9 @@
+clear
+rm /home/ryrzy/android/output/s3/boot.img-ramdisk/lib/modules/*.ko
+rm /home/ryrzy/android/output/s3/zImage
+make ARCH=arm clean
+make arch=arm m0_00_defconfig
+make -j3 ARCH=arm
+find . -name "*.ko" -exec cp {} ../output/s3/boot.img-ramdisk/lib/modules \;
+cp arch/arm/boot/zImage ../output/s3/zImage
+make ARCH=arm clean
