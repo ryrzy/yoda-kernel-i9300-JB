@@ -737,7 +737,7 @@ static int exynos_cpufreq_cpu_init(struct cpufreq_policy *policy)
 	policy->max = 1400000;
 	policy->min = 200000;
 
-	return 0
+	return 0;
 }
 
 static int exynos_cpufreq_reboot_notifier_call(struct notifier_block *this,
