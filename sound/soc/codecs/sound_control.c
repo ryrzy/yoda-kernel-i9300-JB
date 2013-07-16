@@ -251,7 +251,7 @@ unsigned int sound_control_hook_wm8994_write(unsigned int reg, unsigned int val)
 	}
 
 	// print debug info
-	if (unlikely(debug(DEBUG_VERBOSE)))
+	if (debug(DEBUG_VERBOSE))
 		printk("Audio: write hook %d -> %d (Orig:%d), output:%d r:%d\n",
 				reg, newval, val, output_type, is_fmradio);
 
@@ -277,7 +277,7 @@ static int wm8994_write(struct snd_soc_codec *codec, unsigned int reg,
 	}
 
 	// print debug info
-	if (unlikely(debug(DEBUG_VERBOSE)))
+	if (debug(DEBUG_VERBOSE))
 		printk("Audio: write register %d -> %d\n", reg, value);
 
 	return wm8994_reg_write(codec->control_data, reg, value);
@@ -406,7 +406,7 @@ void set_speaker(void)
         wm8994_write(codec, WM8994_SPEAKER_VOLUME_RIGHT, val | WM8994_SPKOUT_VU);
 
 	// print debug info
-	if (unlikely(debug(DEBUG_NORMAL))) {
+	if (debug(DEBUG_NORMAL)) {
 		if (privacy_mode && output_type == OUTPUT_HP) {
 			printk("Audio: %s to mute (privacy mode)\n", __func__);
 		} else {
@@ -437,21 +437,13 @@ void set_eq(void)
 	 * 1. Either HP equalizer or speaker equalizer is on
 	 * 2. And the audio output is NOT the receiver */
 
-	switch (output_type) {   
-		case OUTPUT_HP:
-		    is_eq = eq & EQ_ENABLED;
-		    break;
-		case OUTPUT_SPEAKER:
-		    is_eq = eq_speaker;
-		    break;
-		default:
-		    is_eq = false;
-	}
+	is_eq = (output_type != OUTPUT_RECEIVER) && 
+		(eq & EQ_ENABLED || eq_speaker);
 
 	// switch equalizer based on internal status
 	val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
 
-	if (likely(is_eq))
+	if (is_eq)
 		val |= WM8994_AIF1DAC1_EQ_ENA_MASK;
 	else
 		val &= ~WM8994_AIF1DAC1_EQ_ENA_MASK;
@@ -496,7 +488,7 @@ void set_eq_gains(void)
 	gain5 = eq_gains[out][4];
 
 	// print debug info
-	if (unlikely(debug(DEBUG_NORMAL)))
+	if (debug(DEBUG_NORMAL))
 		printk("Audio: %s (%d) %d %d %d %d %d\n", __func__,
 			output_type,
 			gain1, gain2, gain3, gain4, gain5);
@@ -555,7 +547,7 @@ void set_eq_bands()
 		} 
 	}
 
-	if (unlikely(debug(DEBUG_NORMAL))) {
+	if (debug(DEBUG_NORMAL)) {
 		for(i = 0; i < 5; i++) {
 			printk("Audio: %s %d (%d) %d %d %d %d\n",
 				__func__, i+1, output_type,
@@ -582,7 +574,7 @@ void set_eq_satprevention(void)
 	}
 
 	// print debug information
-	if (unlikely(debug(DEBUG_NORMAL))) {
+	if (debug(DEBUG_NORMAL)) {
 		/* Output current equalizer status and saturation prevention mode */
 		if (is_eq && (eq & EQ_SATPREVENT || eq_speaker)) {
 			printk("Audio: %s to on (%d)\n", __func__, output_type);
@@ -623,7 +615,7 @@ void set_speaker_boost(void)
 	wm8994_write(codec, WM8994_CLASSD, val);
 
 	// print debug info
-	if (unlikely(debug(DEBUG_NORMAL)))
+	if (debug(DEBUG_NORMAL))
 		printk("Audio: %s %d\n", __func__, boostval);
 }
 
@@ -646,7 +638,7 @@ void set_dac_direct(void)
 
 	// take value of the right channel as reference, check for the bypass bit
 	// and print debug information
-	if (unlikely(debug(DEBUG_NORMAL)))
+	if (debug(DEBUG_NORMAL))
 		printk("Audio: set_dac_direct %s\n", 
 			(val & WM8994_DAC1R_TO_HPOUT1R) ? "on":"off");
 
@@ -655,25 +647,25 @@ void set_dac_direct(void)
 unsigned int get_dac_direct_l(unsigned int val)
 {
 	// dac direct is only enabled if fm radio is not active
-	if (likely(dac_direct && !is_fmradio)) {
+	if (dac_direct && !is_fmradio) {
 		// enable dac_direct: bypass for both channels, mute output mixer
 		return((val & ~WM8994_DAC1L_TO_MIXOUTL) | WM8994_DAC1L_TO_HPOUT1L);
 	}
 
 	// disable dac_direct: enable bypass for both channels, mute output mixer
-	return ((val & ~WM8994_DAC1L_TO_HPOUT1L) | WM8994_DAC1L_TO_MIXOUTL);
+	return((val & ~WM8994_DAC1L_TO_HPOUT1L) | WM8994_DAC1L_TO_MIXOUTL);
 }
 
 unsigned int get_dac_direct_r(unsigned int val)
 {
 	// dac direct is only enabled if fm radio is not active
-	if (likely(dac_direct && !is_fmradio)) {
+	if (dac_direct && !is_fmradio) {
 		// enable dac_direct: bypass for both channels, mute output mixer
 		return((val & ~WM8994_DAC1R_TO_MIXOUTR) | WM8994_DAC1R_TO_HPOUT1R);
 	}
 
 	// disable dac_direct: enable bypass for both channels, mute output mixer
-	return ((val & ~WM8994_DAC1R_TO_HPOUT1R) | WM8994_DAC1R_TO_MIXOUTR);
+	return((val & ~WM8994_DAC1R_TO_HPOUT1R) | WM8994_DAC1R_TO_MIXOUTR);
 }
 
 
@@ -687,12 +679,12 @@ void set_dac_oversampling()
 	val = wm8994_read(codec, WM8994_OVERSAMPLING);
 
 	// toggle oversampling bit depending on status + print debug
-	if (likely(dac_oversampling))
+	if (dac_oversampling)
 		val |= WM8994_DAC_OSR128;
 	else
 		val &= ~WM8994_DAC_OSR128;
 
-	if (unlikely(debug(DEBUG_NORMAL)))
+	if (debug(DEBUG_NORMAL))
 		printk("Audio: %s %s\n", __func__, dac_oversampling ? "on":"off");
 
 	// write value back to audio hub
@@ -717,7 +709,7 @@ void set_fll_tuning(void)
 	// write value back to audio hub
 	wm8994_write(codec, WM8994_FLL1_CONTROL_4, val);
 
-	if (unlikely(debug(DEBUG_NORMAL)))
+	if (debug(DEBUG_NORMAL))
 		printk("Audio: %s %s\n", __func__, dac_oversampling ? "on":"off");
 }
 
@@ -738,10 +730,10 @@ void set_stereo_expansion(void)
 	if (stereo_expansion_gain != STEREO_EXPANSION_GAIN_OFF) {
 		val |= (stereo_expansion_gain << WM8994_AIF1DAC1_3D_GAIN_SHIFT) | WM8994_AIF1DAC1_3D_ENA;
 
-		if (unlikely(debug(DEBUG_NORMAL)))
+		if (debug(DEBUG_NORMAL))
 			printk("Audio: set_stereo_expansion set to %d\n", stereo_expansion_gain);
 	} else
-		if (unlikely(debug(DEBUG_NORMAL)))
+		if (debug(DEBUG_NORMAL))
 			printk("Audio: set_stereo_expansion off\n");
 
 	// write value back to audio hub
@@ -758,10 +750,10 @@ void set_mono_downmix(void)
 	if (output_type == OUTPUT_HP) {
 		val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_1);
 
-		if (unlikely(mono_downmix))
-			val |= WM8994_AIF1DAC1_MONO;
-		else
+		if (mono_downmix)
 			val &= ~WM8994_AIF1DAC1_MONO;
+		else
+			val |= WM8994_AIF1DAC1_MONO;
 		
 		wm8994_write(codec, WM8994_AIF1_DAC1_FILTERS_1, val);
 
@@ -773,7 +765,7 @@ void set_mono_downmix(void)
 
 unsigned int get_mono_downmix(unsigned int val)
 {
-	if (unlikely(mono_downmix))
+	if (mono_downmix)
 		return val | WM8994_AIF1DAC1_MONO;
 	else
 		return val & ~WM8994_AIF1DAC1_MONO;
