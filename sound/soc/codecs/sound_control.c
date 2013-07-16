@@ -1,9 +1,13 @@
 /*
- * Author: Andrei F. <https://github.com/AndreiLux>
- *          Complete re-work and refactoring of andip71's implementation
+ * Author: Andrei F. 19.03.2013:
+ * 	Implementation fork: Code refactoring and sysfs rewrite.
  *
- * credits: andip71 for Boeffla sound implementation
- *          Supercurio for idea and code from first implementation Voodoo Sound,
+ * Author: andip71, 26.02.2013
+ *
+ * Version 1.6.0
+ *
+ * credits: Supercurio for ideas and partially code from his Voodoo
+ * 	    sound implementation,
  *          Yank555 for great support on problem analysis,
  *          Gokhanmoral for further modifications to the original code
  *
@@ -21,7 +25,6 @@
 #include <sound/soc.h>
 #include <sound/core.h>
 #include <sound/jack.h>
-#include <sound/soc-dapm.h>
 
 #include <linux/mfd/wm8994/core.h>
 #include <linux/mfd/wm8994/registers.h>
@@ -31,12 +34,11 @@
 #include <linux/sysfs.h>
 #include <linux/sysfs_helpers.h>
 #include <linux/miscdevice.h>
+#include <linux/switch.h>
 
 #include "wm8994.h"
 
 #include "sound_control.h"
-
-#include <mach/media_monitor.h>
 
 /*****************************************/
 // Static variables
@@ -69,18 +71,19 @@ static unsigned int eq_bands_original[EQ_TYPE_MAX][5][4] = {
 // pointer to codec structure
 static struct snd_soc_codec *codec;
 static struct wm8994_priv *wm8994;
+extern struct switch_dev android_switch;
 
 // internal sound control variables
 static int sound_control;		// sound control master switch
 static int debug_level;			// debug level for logging into kernel log
 
 static int headphone_l, headphone_r;	// headphone volume left/right
+
 static int speaker_l, speaker_r;	// speaker volume left/right
 
+static int eq;   			// activates headphone eq
+static int eq_speaker;  		// activates speaker eq
 static int speaker_boost_level = SPEAKER_BOOST_TUNED;	// boost level for speakers
-
-static int eq;   			// headphone eq
-static int eq_speaker;  		// speaker eq
 
 // gain information for equalizer
 static int eq_gains[EQ_TYPE_MAX][5] = { { EQ_GAIN_DEFAULT } };	
@@ -88,69 +91,75 @@ static int eq_gains[EQ_TYPE_MAX][5] = { { EQ_GAIN_DEFAULT } };
 // frequency setup for equalizer
 static unsigned int eq_bands[EQ_TYPE_MAX][5][4] = { { { 0 } } };
 
-static int dac_direct;			// dac_direct for headphone eq
-static int dac_oversampling;		// 128bit oversampling for headphone eq
-static int fll_tuning;			// fll tuning to avoid jitter
-static int stereo_expansion_gain;	// stereo expansion effect if greater than zero
-static int mono_downmix;		// mono downmix
-static int privacy_mode;		// privacy mode
+static int dac_direct;			// activate dac_direct for headphone eq
+static int dac_oversampling;		// activate 128bit oversampling for headphone eq
+static int fll_tuning;			// activate fll tuning to avoid jitter
+static int stereo_expansion_gain;	// activate stereo expansion effect if greater than zero
+static int mono_downmix;		// activate mono downmix
+static int privacy_mode;		// activate privacy mode
 
-static int mic_level_call;		// microphone sensivity while output on earpiece (calls)
-static int mic_level_camera;		// sensitivity during camera recording
-static int mic_level_general;		// sensitivity in all other situations
-
-static bool is_fmradio;			// if FM radio input is active
-static bool is_eq;			// if an equalizer (headphone or speaker tuning) is active
+static int mic_level_general;		// microphone sensivity for general recording purposes
+static int mic_level_call;		// microphone sensivity for call only
 
 static unsigned int debug_register;	// current register to show in debug register interface
+
+// internal state variables
+static bool is_call;			// is currently a call active?
+static bool is_headphone;		// is headphone connected?
+static bool is_socket;			// is something connected to the headphone socket?
+static bool is_fmradio;			// is stock fm radio app active?
+static bool is_eq;			// is an equalizer (headphone or speaker tuning) active?
+static bool is_mic_controlled;		// is microphone sensivity controlled by Audio or not?
+static bool is_mono_downmix;		// is mono downmix active?
+
 static int regdump_bank;		// current bank configured for register dump
 static unsigned int regcache[REGDUMP_BANKS * REGDUMP_REGISTERS + 1];	// register cache to highlight changes in dump
 
 static int mic_level;			// internal mic level
-static int output_type = OUTPUT_OTHER;	// current sound output device
+
 
 /*****************************************/
 // Internal function declarations
 /*****************************************/
 
-extern int wm8994_readable(struct snd_soc_codec *codec, unsigned int reg);
-extern int wm8994_volatile(struct snd_soc_codec *codec, unsigned int reg);
-extern unsigned int wm8994_read(struct snd_soc_codec *codec, unsigned int reg);
-static int wm8994_write(struct snd_soc_codec *codec,
-			unsigned int reg, unsigned int value);
+static unsigned int wm8994_read(struct snd_soc_codec *codec, unsigned int reg);
+static int wm8994_write(struct snd_soc_codec *codec, unsigned int reg, unsigned int value);
 
-bool debug(int level);
-bool check_for_fmradio(void);
-void handler_output_detection(void);
+static bool debug(int level);
+static bool check_for_call(bool load_register, unsigned int val);
+static bool check_for_socket(unsigned int val);
+static bool check_for_headphone(void);
+static bool check_for_fmradio(void);
+static void handler_headphone_detection(void);
 
-void set_headphone(void);
-unsigned int get_headphone_l(unsigned int val);
-unsigned int get_headphone_r(unsigned int val);
+static void set_headphone(void);
+static unsigned int get_headphone_l(unsigned int val);
+static unsigned int get_headphone_r(unsigned int val);
 
-void set_speaker(void);
-unsigned int get_speaker_channel_volume(int channel, unsigned int val);
+static void set_speaker(void);
+static unsigned int get_speaker_channel_volume(int channel, unsigned int val);
 
-void set_eq(void);
-void set_eq_gains(void);
-void set_eq_bands(void);
-void set_eq_satprevention(void);
-unsigned int get_eq_satprevention(int reg_index, unsigned int val);
-void set_speaker_boost(void);
+static void set_eq(void);
+static void set_eq_gains(void);
+static void set_eq_bands(void);
+static void set_eq_satprevention(void);
+static unsigned int get_eq_satprevention(int reg_index, unsigned int val);
+static void set_speaker_boost(void);
 
-void set_dac_direct(void);
-unsigned int get_dac_direct_l(unsigned int val);
-unsigned int get_dac_direct_r(unsigned int val);
+static void set_dac_direct(void);
+static unsigned int get_dac_direct_l(unsigned int val);
+static unsigned int get_dac_direct_r(unsigned int val);
 
-void set_dac_oversampling(void);
-void set_fll_tuning(void);
-void set_stereo_expansion(void);
-void set_mono_downmix(void);
-unsigned int get_mono_downmix(unsigned int val);
+static void set_dac_oversampling(void);
+static void set_fll_tuning(void);
+static void set_stereo_expansion(void);
+static void set_mono_downmix(void);
+static unsigned int get_mono_downmix(unsigned int val);
 
-void set_mic_level(void);
-unsigned int get_mic_level(int reg_index, unsigned int val);
+static void set_mic_level(void);
+static unsigned int get_mic_level(int reg_index, unsigned int val);
 
-void reset_sound_control(void);
+static void reset_sound_control(void);
 
 /*****************************************/
 // Sound hook functions for
@@ -179,6 +188,7 @@ void sound_control_hook_wm8994_pcm_probe(struct snd_soc_codec *codec_pointer)
 	}
 }
 
+
 unsigned int sound_control_hook_wm8994_write(unsigned int reg, unsigned int val)
 {
 	unsigned int newval;
@@ -191,13 +201,48 @@ unsigned int sound_control_hook_wm8994_write(unsigned int reg, unsigned int val)
 	 * change value to sound control values accordingly as new return value */
 	newval = val;
 
-	/* Headphone plug-in detection */
-	handler_output_detection();
-
-	/* FM Radio detection, if active, DAC Direct hooks below will override */
-	is_fmradio = check_for_fmradio();
-
 	switch (reg) {
+		// call detection
+		case WM8994_AIF2_CONTROL_2:
+			if (is_call != check_for_call(false, val)) {
+				is_call = !is_call;
+
+				if (debug(DEBUG_NORMAL))
+					printk("Audio: Call detection new status %d\n", is_call);
+
+				// switch equalizer (and all follow-up functionalities like gains, bands, satprevention etc.)
+				set_eq();
+
+				// switch mic level and mono downmix
+				set_mic_level();
+				set_mono_downmix();
+			}
+
+			break;
+
+		// socket connection/disconnection detection (incl. headphone un-plug)
+		// (see headphone detection below for plug-in)
+		case WM1811_JACKDET_CTRL:
+			if (check_for_socket(val)) {
+				is_socket = true;
+
+				if (debug(DEBUG_NORMAL))
+					printk("Audio: Socket plugged-in\n");
+			} else {
+				is_socket = false;
+				is_headphone = false;
+
+				if (debug(DEBUG_NORMAL))
+					printk("Audio: Socket un-plugged\n");
+
+				// Handler: switch equalizer (and all connected functions),
+				// mono downmix and set speaker volume (for privacy mode)
+				set_eq();
+				set_mono_downmix();
+				set_speaker();
+			}
+			break;
+
 		// left headphone volume
 		case WM8994_LEFT_OUTPUT_VOLUME:
 			newval = get_headphone_l(val);
@@ -241,26 +286,115 @@ unsigned int sound_control_hook_wm8994_write(unsigned int reg, unsigned int val)
 
 		// Microphone: left input level
 		case WM8994_LEFT_LINE_INPUT_1_2_VOLUME:
-			newval = get_mic_level(reg, val);
+			newval = get_mic_level(1, val);
 			break;
 
 		// Microphone: right input level
 		case WM8994_RIGHT_LINE_INPUT_1_2_VOLUME:
-			newval = get_mic_level(reg, val);
-			break;			
+			newval = get_mic_level(2, val);
+			break;
+	}
+
+	// Headphone plug-in detection
+	// ( for un-plug detection see above, this is covered by checking a register)
+	if (is_socket && !is_headphone)
+		handler_headphone_detection();
+
+	// FM radio detection
+	// Important note: We need to absolutely make sure we do not do this detection if one of the
+	// two output mixers are called in this hook (as they can potentially be modified again in the
+	// set_dac_direct call). Otherwise this adds strange value overwriting effects.
+	if ( is_fmradio != check_for_fmradio() &&
+		(reg != WM8994_OUTPUT_MIXER_1) && 
+		(reg != WM8994_OUTPUT_MIXER_2) )
+	{
+		is_fmradio = !is_fmradio;
+
+		if (debug(DEBUG_NORMAL))
+			printk("Audio: FM radio detection new status %d\n", is_fmradio);
+
+		set_dac_direct();
 	}
 
 	// print debug info
 	if (debug(DEBUG_VERBOSE))
-		printk("Audio: write hook %d -> %d (Orig:%d), output:%d r:%d\n",
-				reg, newval, val, output_type, is_fmradio);
+		printk("Audio: write hook %d -> %d (Orig:%d), c:%d, h:%d, r:%d\n",
+				reg, newval, val, is_call, is_headphone, is_fmradio);
 
 	return newval;
 }
 
+
 /*****************************************/
-// Internal helper functions
+// Internal functions copied over from
+// original wm8994 alsa driver,
+// enriched by some debug prints
 /*****************************************/
+
+static int wm8994_readable(struct snd_soc_codec *codec, unsigned int reg)
+{
+	//struct wm8994_priv *wm8994 = snd_soc_codec_get_drvdata(codec);
+	struct wm8994 *control = codec->control_data;
+
+	switch (reg) {
+	case WM8994_GPIO_1:
+	case WM8994_GPIO_2:
+	case WM8994_GPIO_3:
+	case WM8994_GPIO_4:
+	case WM8994_GPIO_5:
+	case WM8994_GPIO_6:
+	case WM8994_GPIO_7:
+	case WM8994_GPIO_8:
+	case WM8994_GPIO_9:
+	case WM8994_GPIO_10:
+	case WM8994_GPIO_11:
+	case WM8994_INTERRUPT_STATUS_1:
+	case WM8994_INTERRUPT_STATUS_2:
+	case WM8994_INTERRUPT_STATUS_1_MASK:
+	case WM8994_INTERRUPT_STATUS_2_MASK:
+	case WM8994_INTERRUPT_RAW_STATUS_2:
+		return 1;
+
+	case WM8958_DSP2_PROGRAM:
+	case WM8958_DSP2_CONFIG:
+	case WM8958_DSP2_EXECCONTROL:
+		if (control->type == WM8958)
+			return 1;
+		else
+			return 0;
+
+	default:
+		break;
+	}
+
+	if (reg >= WM8994_CACHE_SIZE)
+		return 0;
+	return wm8994_access_masks[reg].readable != 0;
+}
+
+
+static int wm8994_volatile(struct snd_soc_codec *codec, unsigned int reg)
+{
+	if (reg >= WM8994_CACHE_SIZE)
+		return 1;
+
+	switch (reg) {
+	case WM8994_SOFTWARE_RESET:
+	case WM8994_CHIP_REVISION:
+	case WM8994_DC_SERVO_1:
+	case WM8994_DC_SERVO_READBACK:
+	case WM8994_RATE_STATUS:
+	case WM8994_LDO_1:
+	case WM8994_LDO_2:
+	case WM8958_DSP2_EXECCONTROL:
+	case WM8958_MIC_DETECT_3:
+	case WM8994_DC_SERVO_4E:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 
 static int wm8994_write(struct snd_soc_codec *codec, unsigned int reg,
 	unsigned int value)
@@ -283,70 +417,146 @@ static int wm8994_write(struct snd_soc_codec *codec, unsigned int reg,
 	return wm8994_reg_write(codec->control_data, reg, value);
 }
 
-bool check_for_dapm(enum snd_soc_dapm_type dapm_type, char* widget_name)
+
+static unsigned int wm8994_read(struct snd_soc_codec *codec,
+				unsigned int reg)
 {
-	struct snd_soc_dapm_widget *w;
+	unsigned int val;
+	int ret;
 
-	/* Iterate widget list and find power mode of given widget per its name */
-	list_for_each_entry(w, &codec->card->widgets, list) {
-		if (w->dapm != &codec->dapm)
-			continue;
+	BUG_ON(reg > WM8994_MAX_REGISTER);
 
-		/* DAPM types in include/sound/soc-dapm.h */
-		if (w->id == dapm_type && !strcmp(w->name, widget_name))
-			return w->power;
+	if (!wm8994_volatile(codec, reg) && wm8994_readable(codec, reg) &&
+	    reg < codec->driver->reg_cache_size) {
+		ret = snd_soc_cache_read(codec, reg, &val);
+		if (ret >= 0)
+		{
+			// print debug info
+			if (debug(DEBUG_VERBOSE))
+				printk("Audio: read register from cache %d -> %d\n", reg, val);
+
+			return val;
+		}
+		else
+			dev_err(codec->dev, "Cache read from %x failed: %d",
+				reg, ret);
 	}
+
+	val = wm8994_reg_read(codec->control_data, reg);
+
+	// print debug info
+	if (debug(DEBUG_VERBOSE))
+		printk("Audio: read register %d -> %d\n", reg, val);
+
+	return val;
+}
+
+
+/*****************************************/
+// Internal helper functions
+/*****************************************/
+
+static bool check_for_call(bool load_register, unsigned int val)
+{
+#ifdef CONFIG_SND_SOC_SAMSUNG_MIDAS_WM1811
+	// if a check outside the write hook should be performed, the current register
+	// value needs to be loaded first
+	if (load_register)
+		val = wm8994_read(codec, WM8994_AIF2_CONTROL_2);
+
+	// check via register WM8994_AIF2DACR if currently call active
+	if (!(val & WM8994_AIF2DACR_SRC_MASK))
+		return true;
+#endif
 
 	return false;
 }
 
-bool check_for_fmradio(void) 
+
+static bool check_for_socket(unsigned int val)
 {
-	return check_for_dapm(snd_soc_dapm_line, "FM In");
+	// check via register WM1811_JACKDET if something is plugged in currently
+	if (val & WM1811_JACKDET_DB_MASK)
+		return false;
+
+	return true;
 }
 
-bool check_for_receiver(void) 
+
+static bool check_for_headphone(void)
 {
-	return check_for_dapm(snd_soc_dapm_spk, "RCV");
+	return (switch_get_state(&android_switch) > 0);
 }
 
-bool check_for_speaker(void) 
+
+static bool check_for_fmradio(void)
 {
-	return check_for_dapm(snd_soc_dapm_spk, "SPK");
+#ifdef CONFIG_FM_RADIO
+	struct snd_soc_dapm_widget *w;
+
+	// loop through widget list to find widget for FM radio and check
+	// power state of it
+	list_for_each_entry(w, &codec->card->widgets, list) {
+		if (w->dapm != &codec->dapm)
+			continue;
+
+		switch (w->id) {
+			case snd_soc_dapm_line:
+				if (w->name) {
+					if(strstr(w->name,"FM In") != 0) {
+						if((w->power) != 0)
+							return true;
+						else
+							return false;
+					}
+				}
+				break;
+			case snd_soc_dapm_mic:
+			case snd_soc_dapm_hp:
+			case snd_soc_dapm_spk:
+			case snd_soc_dapm_micbias:
+			case snd_soc_dapm_dac:
+			case snd_soc_dapm_adc:
+			case snd_soc_dapm_pga:
+			case snd_soc_dapm_out_drv:
+			case snd_soc_dapm_mixer:
+			case snd_soc_dapm_mixer_named_ctl:
+			case snd_soc_dapm_supply:
+				break;
+			default:
+				break;
+		}
+	}
+#endif
+
+	return false;
 }
 
-bool check_for_headphone(void)
+
+static void handler_headphone_detection(void)
 {
-	return check_for_dapm(snd_soc_dapm_hp, "HP");
-}
+	if (check_for_headphone()) {
+		is_headphone = true;
 
-void handler_output_detection(void)
-{
-	int new_output = OUTPUT_OTHER;
+		if (debug(DEBUG_NORMAL))
+			printk("Audio: Headphone or headset found\n");
 
-	if (check_for_headphone())
-		new_output = OUTPUT_HP;
-	else if (check_for_speaker())
-		new_output = OUTPUT_SPEAKER;
-	else if (check_for_receiver())
-		new_output = OUTPUT_RECEIVER;
-	
-	if (new_output != OUTPUT_OTHER && new_output != output_type) {
-		output_type = new_output;
-
+		// Handler: switch equalizer and mono downmix, set speaker volume (for privacy mode)
 		set_eq();
 		set_mono_downmix();
 		set_speaker();
-		set_mic_level();
 	}
 }
 
-bool debug(int level)
+
+static bool debug(int level)
 {
 	// determine whether a debug information should be printed 
 	// according to currently configured debug level, or not
+	if (level <= debug_level)
+		return true;
 
-	return (level <= debug_level);
+	return false;
 }
 
 
@@ -356,7 +566,7 @@ bool debug(int level)
 
 // Headphone volume
 
-void set_headphone(void)
+static void set_headphone(void)
 {
 	unsigned int val;
 
@@ -376,14 +586,14 @@ void set_headphone(void)
 }
 
 
-unsigned int get_headphone_l(unsigned int val)
+static unsigned int get_headphone_l(unsigned int val)
 {
 	// return register value for left headphone volume back
         return (val & ~WM8994_HPOUT1L_VOL_MASK) | headphone_l;
 }
 
 
-unsigned int get_headphone_r(unsigned int val)
+static unsigned int get_headphone_r(unsigned int val)
 {
 	// return register value for right headphone volume back
         return (val & ~WM8994_HPOUT1R_VOL_MASK) | headphone_r;
@@ -392,7 +602,7 @@ unsigned int get_headphone_r(unsigned int val)
 
 // Speaker volume
 
-void set_speaker(void)
+static void set_speaker(void)
 {
 	unsigned int val;
 
@@ -407,7 +617,7 @@ void set_speaker(void)
 
 	// print debug info
 	if (debug(DEBUG_NORMAL)) {
-		if (privacy_mode && output_type == OUTPUT_HP) {
+		if (privacy_mode && is_headphone) {
 			printk("Audio: %s to mute (privacy mode)\n", __func__);
 		} else {
 			printk("Audio: %s %d %d\n", __func__, speaker_l, speaker_r);
@@ -416,10 +626,10 @@ void set_speaker(void)
 }
 
 
-unsigned int get_speaker_channel_volume(int channel, unsigned int val)
+static unsigned int get_speaker_channel_volume(int channel, unsigned int val)
 {
-	/* Mute speaker if privacy mode is on and output type is line/HP */
-	if (privacy_mode && output_type == OUTPUT_HP)
+	// if privacy mode is on, we set value to zero, otherwise to configured speaker volume
+	if (privacy_mode && is_headphone)
 		return (val & ~WM8994_SPKOUTL_VOL_MASK);
 
 	return (val & ~WM8994_SPKOUTL_VOL_MASK) | channel;
@@ -427,18 +637,17 @@ unsigned int get_speaker_channel_volume(int channel, unsigned int val)
 
 // Equalizer on/off
 
-void set_eq(void)
+static void set_eq(void)
 {
 	unsigned int val;
 
-	/* Set equalizer active flag
-	 *
-	 * Equalizer will only be switched on if
-	 * 1. Either HP equalizer or speaker equalizer is on
-	 * 2. And the audio output is NOT the receiver */
+	// Equalizer will only be switched on in fact if
+	// 1. headphone eq is on, there is no call and there is headphone connected -- or --
+	// 2. speaker tuning is enabled, there is no call and there is no headphone connected
 
-	is_eq = (output_type != OUTPUT_RECEIVER) && 
-		(eq & EQ_ENABLED || eq_speaker);
+	// set internal state variables
+	is_eq = !is_call && ( (eq & EQ_ENABLED && is_headphone) || 
+			      (eq_speaker && !is_headphone) );
 
 	// switch equalizer based on internal status
 	val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
@@ -463,23 +672,13 @@ void set_eq(void)
 
 // Equalizer gains
 
-void set_eq_gains(void)
+static void set_eq_gains(void)
 {
 	unsigned int val, out;
 	unsigned int gain1, gain2, gain3, gain4, gain5;
 
-	/* Determine data index */
-	switch (output_type) {
-		case OUTPUT_HP:	
-			out = EQ_HP;
-			break;
-		case OUTPUT_SPEAKER:
-			out = EQ_SP;
-			break;
-		default:
-			/* Output type doesn't have data */
-			return;
-	}
+	// determine gain values based on equalizer mode (headphone vs. speaker tuning)
+	out = (!is_headphone && eq_speaker) ? EQ_SP : EQ_HP;
 
 	gain1 = eq_gains[out][0];
 	gain2 = eq_gains[out][1];
@@ -489,9 +688,8 @@ void set_eq_gains(void)
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
-		printk("Audio: %s (%d) %d %d %d %d %d\n", __func__,
-			output_type,
-			gain1, gain2, gain3, gain4, gain5);
+		printk("Audio: %s (%s) %d %d %d %d %d\n", __func__,
+			out ? "headphone" : "speaker", gain1, gain2, gain3, gain4, gain5);
 
 	// First register
 	// read current value from audio hub and mask all bits apart from equalizer enabled bit,
@@ -516,26 +714,13 @@ void set_eq_gains(void)
 
 // Equalizer bands
 
-void set_eq_bands()
+static void set_eq_bands()
 {
 	// Set band frequencies either for headphone eq or for speaker tuning
 	int i = WM8994_AIF1_DAC1_EQ_BAND_1_A;
 	int j = 0;
 	int k = 0;
-	int o;
-	
-	/* Determine data index */
-	switch (output_type) {
-		case OUTPUT_HP:	
-			o = EQ_HP;
-			break;
-		case OUTPUT_SPEAKER:
-			o = EQ_SP;
-			break;
-		default:
-			/* Output type doesn't have data */
-			return;
-	}
+	int o = (!is_headphone && eq_speaker) ? EQ_SP : EQ_HP;
 
 	while (i <= WM8994_AIF1_DAC1_EQ_BAND_5_PG) {
 		if(eq_bands[o][j][k])
@@ -549,8 +734,8 @@ void set_eq_bands()
 
 	if (debug(DEBUG_NORMAL)) {
 		for(i = 0; i < 5; i++) {
-			printk("Audio: %s %d (%d) %d %d %d %d\n",
-				__func__, i+1, output_type,
+			printk("Audio: %s %d (%s) %d %d %d %d\n",
+				__func__, i+1, o ? "headphone" : "speaker",
 				eq_bands[o][i][0], eq_bands[o][i][1],
 				eq_bands[o][i][2], eq_bands[o][i][3]);
 		}
@@ -560,7 +745,7 @@ void set_eq_bands()
 
 // EQ saturation prevention
 
-void set_eq_satprevention(void)
+static void set_eq_satprevention(void)
 {
 	unsigned int val, i;
 
@@ -576,9 +761,16 @@ void set_eq_satprevention(void)
 	// print debug information
 	if (debug(DEBUG_NORMAL)) {
 		/* Output current equalizer status and saturation prevention mode */
-		if (is_eq && (eq & EQ_SATPREVENT || eq_speaker)) {
-			printk("Audio: %s to on (%d)\n", __func__, output_type);
-			return;
+		if (is_eq) {
+			if (is_headphone && (eq & EQ_SATPREVENT)) {
+				printk("Audio: %s to on (headphone)\n", __func__);
+				return;
+			}
+
+			if (!is_headphone && eq_speaker) {
+				printk("Audio: %s to on (speaker)\n", __func__);
+				return;
+			}
 		}
 
 		printk("Audio: %s to off\n", __func__);
@@ -586,13 +778,15 @@ void set_eq_satprevention(void)
 }
 
 
-unsigned int get_eq_satprevention(int reg_index, unsigned int val)
+static unsigned int get_eq_satprevention(int reg_index, unsigned int val)
 {
-	if (output_type == OUTPUT_HP && eq & EQ_SATPREVENT)
-		return aif_drc_values[AIF1_DRC1_PREVENT][reg_index];
+	if (is_eq) {
+		if (is_headphone && (eq & EQ_SATPREVENT))
+			return aif_drc_values[AIF1_DRC1_PREVENT][reg_index];
 
-	if (output_type == OUTPUT_SPEAKER && eq_speaker)
-		return aif_drc_values[AIF1_DRC1_STUNING][reg_index];
+		if (!is_headphone && eq_speaker)
+			return aif_drc_values[AIF1_DRC1_STUNING][reg_index];
+	}
 
 	return aif_drc_values[AIF1_DRC1_DEFAULT][reg_index];
 }
@@ -600,13 +794,12 @@ unsigned int get_eq_satprevention(int reg_index, unsigned int val)
 
 // Speaker boost (for speaker tuning)
 
-void set_speaker_boost(void)
+static void set_speaker_boost(void)
 {
 	unsigned int val, boostval;
 
-	/* Speaker boost is only active on external speaker and its EQ is on */
-	boostval = (output_type == OUTPUT_SPEAKER && eq_speaker) ? \
-			speaker_boost_level : SPEAKER_BOOST_DEFAULT;
+	// Speaker boost gets activated only if EQ mode is for speaker tuning
+	boostval = (!is_headphone && eq_speaker) ? speaker_boost_level : SPEAKER_BOOST_DEFAULT;
 
 	val = wm8994_read(codec, WM8994_CLASSD);
 	val &= ~(WM8994_SPKOUTL_BOOST_MASK | WM8994_SPKOUTR_BOOST_MASK);
@@ -622,7 +815,7 @@ void set_speaker_boost(void)
 
 // DAC direct
 
-void set_dac_direct(void)
+static void set_dac_direct(void)
 {
 	unsigned int val;
 
@@ -638,13 +831,16 @@ void set_dac_direct(void)
 
 	// take value of the right channel as reference, check for the bypass bit
 	// and print debug information
-	if (debug(DEBUG_NORMAL))
-		printk("Audio: set_dac_direct %s\n", 
-			(val & WM8994_DAC1R_TO_HPOUT1R) ? "on":"off");
+	if (debug(DEBUG_NORMAL)) {
+		if (val & WM8994_DAC1R_TO_HPOUT1R)
+			printk("Audio: set_dac_direct on\n");
+		else
+			printk("Audio: set_dac_direct off\n");
+	}
 
 }
 
-unsigned int get_dac_direct_l(unsigned int val)
+static unsigned int get_dac_direct_l(unsigned int val)
 {
 	// dac direct is only enabled if fm radio is not active
 	if (dac_direct && !is_fmradio) {
@@ -656,7 +852,7 @@ unsigned int get_dac_direct_l(unsigned int val)
 	return((val & ~WM8994_DAC1L_TO_HPOUT1L) | WM8994_DAC1L_TO_MIXOUTL);
 }
 
-unsigned int get_dac_direct_r(unsigned int val)
+static unsigned int get_dac_direct_r(unsigned int val)
 {
 	// dac direct is only enabled if fm radio is not active
 	if (dac_direct && !is_fmradio) {
@@ -671,7 +867,7 @@ unsigned int get_dac_direct_r(unsigned int val)
 
 // DAC oversampling
 
-void set_dac_oversampling()
+static void set_dac_oversampling()
 {
 	unsigned int val;
 
@@ -694,7 +890,7 @@ void set_dac_oversampling()
 
 // FLL tuning
 
-void set_fll_tuning(void)
+static void set_fll_tuning(void)
 {
 	unsigned int val;
 
@@ -716,7 +912,7 @@ void set_fll_tuning(void)
 
 // Stereo expansion
 
-void set_stereo_expansion(void)
+static void set_stereo_expansion(void)
 {
 	unsigned int val;
 
@@ -743,53 +939,63 @@ void set_stereo_expansion(void)
 
 // Mono downmix
 
-void set_mono_downmix(void)
+static void set_mono_downmix(void)
 {
 	unsigned int val;
 
-	if (output_type == OUTPUT_HP) {
-		val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_1);
+	if (!is_call && is_headphone) {
+		if (is_mono_downmix != mono_downmix) {
+			is_mono_downmix = mono_downmix;
+			
+			val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_1);
 
-		if (mono_downmix)
-			val &= ~WM8994_AIF1DAC1_MONO;
-		else
-			val |= WM8994_AIF1DAC1_MONO;
-		
-		wm8994_write(codec, WM8994_AIF1_DAC1_FILTERS_1, val);
+			if (is_mono_downmix)
+				val &= ~WM8994_AIF1DAC1_MONO;
+			else
+				val |= WM8994_AIF1DAC1_MONO;
+			
+			wm8994_write(codec, WM8994_AIF1_DAC1_FILTERS_1, val);
 
-		if (debug(DEBUG_NORMAL))
-			printk("Audio: %s set to %s\n", __func__, mono_downmix ? "on":"off");
+			if (debug(DEBUG_NORMAL))
+				printk("Audio: %s set to %s\n", __func__, is_mono_downmix ? "on":"off");
+		}
 	}
 }
 
 
-unsigned int get_mono_downmix(unsigned int val)
+static unsigned int get_mono_downmix(unsigned int val)
 {
-	if (mono_downmix)
+	if (!mono_downmix)
+		return val;
+
+	if (is_mono_downmix)
 		return val | WM8994_AIF1DAC1_MONO;
-	else
-		return val & ~WM8994_AIF1DAC1_MONO;
+
+	return val & ~WM8994_AIF1DAC1_MONO;
 }
 
 
 // MIC level
 
-void set_mic_level(void)
+static void set_mic_level(void)
 {
 	unsigned int val;
 
-	/* Set mic level depending on call detection */
+	// if mic is not controlled by Audio, terminate and do nothing
+	if (!is_mic_controlled)
+		return;
 
-	mic_level = (output_type == OUTPUT_RECEIVER) ? mic_level_call :
-			mhs_get_status(MHS_CAMERA_STREAM) ? mic_level_camera : 
-			mic_level_general;
+	// check if call is currently active as internal mic sensivity value
+	// is dependent on this
+
+	mic_level = (is_call) ? mic_level_call : mic_level_general;
 
 	// set input volume for both input channels
 	val = wm8994_read(codec, WM8994_LEFT_LINE_INPUT_1_2_VOLUME);
-	wm8994_write(codec, WM8994_LEFT_LINE_INPUT_1_2_VOLUME, mic_level | WM8994_IN1_VU);
+	wm8994_write(codec, WM8994_LEFT_LINE_INPUT_1_2_VOLUME, get_mic_level(1, 0));
 
 	val = wm8994_read(codec, WM8994_RIGHT_LINE_INPUT_1_2_VOLUME);
-	wm8994_write(codec, WM8994_RIGHT_LINE_INPUT_1_2_VOLUME, mic_level | WM8994_IN1_VU);
+	wm8994_write(codec, WM8994_RIGHT_LINE_INPUT_1_2_VOLUME, get_mic_level(2, 0));
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
@@ -797,22 +1003,29 @@ void set_mic_level(void)
 }
 
 
-unsigned int get_mic_level(int reg, unsigned int val)
+static unsigned int get_mic_level(int reg_index, unsigned int val)
 {
-	switch (reg) {
-		case WM8994_LEFT_LINE_INPUT_1_2_VOLUME:
-		case WM8994_RIGHT_LINE_INPUT_1_2_VOLUME:
-			return mic_level | WM8994_IN1_VU;
+
+	// check if mic is currently controlled by Audio
+	// if not, the value is returned back unchanged to not impact the microphone at all
+	if (!is_mic_controlled)
+		return val;
+
+	// send changed values back
+	switch (reg_index) {
+		case 1: //  Register WM8994_LEFT_LINE_INPUT_1_2_VOLUME
+		case 2: //  Register WM8994_RIGHT_LINE_INPUT_1_2_VOLUME
+			return(mic_level | WM8994_IN1_VU);
 	}
 
-	/* In case of wrong register/misuse of function */
+	// we should never reach this point ideally, but in error case return original value
 	return val;
 }
 
 
 // Initialization functions
 
-void initialize_global_variables(void)
+static void initialize_global_variables(void)
 {
 	// set global variables to standard values
 
@@ -841,14 +1054,18 @@ void initialize_global_variables(void)
 	privacy_mode = false;
 
 	mic_level_general = MICLEVEL_GENERAL;
-	mic_level_camera = MICLEVEL_CAMERA;
 	mic_level_call = MICLEVEL_CALL;
 	mic_level = MICLEVEL_GENERAL;
 
 	debug_register = 0;
 
+	is_call = false;
+	is_socket = false;
+	is_headphone = false;
 	is_fmradio = false;
 	is_eq = false;
+	is_mic_controlled = false;
+	is_mono_downmix = false;
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
@@ -856,8 +1073,10 @@ void initialize_global_variables(void)
 }
 
 
-void reset_sound_control(void)
+static void reset_sound_control(void)
 {
+	unsigned int val;
+
 	// print debug info
 	if (debug(DEBUG_NORMAL))
 		printk("Audio: %s start\n", __func__);
@@ -865,27 +1084,48 @@ void reset_sound_control(void)
 	// load all default values
 	initialize_global_variables();
 
+	// set headphone volumes to defaults
 	set_headphone();
+
+	// set speaker volumes to defaults
 	set_speaker();
 
 	// reset equalizer mode
 	// (this also resets gains, bands, saturation prevention and speaker boost)
 	set_eq();
 
+	// reset DAC_direct
 	set_dac_direct();
+
+	// reset DAC oversampling
 	set_dac_oversampling();
+
+	// reset FLL tuning
 	set_fll_tuning();
+
+	// reset stereo expansion
 	set_stereo_expansion();
+
+	// reset mono downmix
 	set_mono_downmix();
 
-	handler_output_detection();
+	// reset mic level
+	set_mic_level();
 
+	// initialize jacket, headphone, call and fm radio status
+	val = wm8994_read(codec, WM1811_JACKDET_CTRL);
+	is_socket = check_for_socket(val);
+
+	is_call = check_for_call(true, 0);
+	handler_headphone_detection();
 	is_fmradio = check_for_fmradio();
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
 		printk("Audio: %s complete\n", __func__);
 }
+
+
 
 /*****************************************/
 // sysfs interface functions
@@ -972,11 +1212,17 @@ static ssize_t debug_info_show(char *buf)
 	val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_2);
 	len += sprintf(buf + len, "WM8994_AIF1_DAC1_FILTERS_2: %d\n", val);
 
-	/* Call detection, headphone, switch state, FM detection, EQ active and mic level */
-	len += sprintf(buf + len, "output_type:%d\n"\
-			"is_fmradio:%d is_eq:%d mic_level:%d\n",
-			output_type,
-			is_fmradio, is_eq, mic_level);
+	// add the current states of call, headphone and fmradio
+	len += sprintf(buf + len, "is_call:%d is_socket: %d is_headphone:%d is_fmradio:%d\n",
+				is_call, is_socket, is_headphone, is_fmradio);
+
+	// add the current states of internal headphone handling and mono downmix
+	len += sprintf(buf + len, "is_eq:%d is_mono_downmix: %d\n",
+				is_eq, is_mono_downmix);
+
+	// add the current states of internal mic level, gain and control state
+	len += sprintf(buf + len, "mic_level: %d is_mic_controlled: %d\n",
+				mic_level, is_mic_controlled);
 
 	return len;
 }
@@ -1044,7 +1290,6 @@ static struct device_attribute sound_control_attrs[] = {
 	SOUND_ATTR(stereo_expansion),
 
 	SOUND_ATTR(mic_level_general),
-	SOUND_ATTR(mic_level_camera),
 	SOUND_ATTR(mic_level_call),
 
 	SOUND_ATTR(eq_hp_gain_1),
@@ -1092,9 +1337,7 @@ enum {
 
 	STEREO_EXPANSION,
 
-	MIC_LEVEL_GENERAL,
-	MIC_LEVEL_CAMERA,
-	MIC_LEVEL_CALL,
+	MIC_LEVEL_GENERAL, MIC_LEVEL_CALL,
 
 	EQ_HP_GAIN_1, EQ_HP_GAIN_2, EQ_HP_GAIN_3, EQ_HP_GAIN_4, EQ_HP_GAIN_5,
 	EQ_HP_BAND_1, EQ_HP_BAND_2, EQ_HP_BAND_3, EQ_HP_BAND_4, EQ_HP_BAND_5,
@@ -1158,8 +1401,6 @@ static ssize_t show_sound_property(struct device *dev,
 
 		case MIC_LEVEL_GENERAL:
 			return sprintf(buf, "%d", mic_level_general);
-		case MIC_LEVEL_CAMERA:
-			return sprintf(buf, "%d", mic_level_camera);
 		case MIC_LEVEL_CALL:
 			return sprintf(buf, "%d", mic_level_call);
 
@@ -1299,18 +1540,18 @@ static ssize_t store_sound_property(struct device *dev,
 			set_stereo_expansion();
 			break;
 
+		
 		case MIC_LEVEL_GENERAL:
-		case MIC_LEVEL_CAMERA:
 		case MIC_LEVEL_CALL:
 			sanitize_min_max(val, MICLEVEL_MIN, MICLEVEL_MAX);
 
 			if(offset == MIC_LEVEL_GENERAL)
 				mic_level_general = val;
 			else
-			if(offset == MIC_LEVEL_CAMERA)
-				mic_level_camera = val;
-			else
 				mic_level_call = val;
+			
+			is_mic_controlled = !((mic_level_general == MICLEVEL_GENERAL)
+						&& (mic_level_call == MICLEVEL_CALL));
 
 			set_mic_level();
 			break;
